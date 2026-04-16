@@ -19,22 +19,22 @@ try:
 except Exception:
     YouTubeTranscriptApi = None
 
-# PDF text extraction
+# PDF text extraction 
 try:
-    from pypdf import PdfReader
+    import pdfplumber
 except Exception:
-    PdfReader = None
+    pdfplumber = None
 
-# Configuration
+# Configuration - Optimized for better retrieval
 DEFAULT_LINKS_FILE = "palav_url_links.txt"
-CHUNK_CHARS = 1800
-CHUNK_OVERLAP = 250
-TOP_K = 6
-MIN_SIM_THRESHOLD = 0.30 
+CHUNK_CHARS = 3000        
+CHUNK_OVERLAP = 500       
+TOP_K = 10                
+MIN_SIM_THRESHOLD = 0.22  
 
 # Models
 EMBED_MODEL = "text-embedding-3-small"  
-ANSWER_MODEL_DEFAULT = "gpt-4o-mini" # Corrected model name string
+ANSWER_MODEL_DEFAULT = "gpt-4o-mini"
 
 # Persistence
 INDEX_DIR = ".palav_index_cache"  
@@ -90,20 +90,25 @@ def fetch_html_text(url: str, timeout: int = 20) -> Tuple[str, str]:
     return title, normalize_whitespace(text)
 
 def fetch_pdf_text(url: str, timeout: int = 30) -> Tuple[str, str]:
-    if PdfReader is None:
-        raise RuntimeError("pypdf is not installed.")
+    if pdfplumber is None:
+        raise RuntimeError("pdfplumber is not installed. Add it to requirements.txt")
+    
     r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
+    
     from io import BytesIO
-    reader = PdfReader(BytesIO(r.content))
     title = url
-    try:
-        meta = reader.metadata
-        if meta and getattr(meta, "title", None):
-            title = meta.title
-    except Exception:
-        pass
-    pages_text = [p.extract_text() or "" for p in reader.pages]
+    pages_text = []
+    
+    with pdfplumber.open(BytesIO(r.content)) as pdf:
+        if pdf.metadata and 'Title' in pdf.metadata:
+            title = pdf.metadata['Title']
+            
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                pages_text.append(text)
+                
     return title, normalize_whitespace("\n".join(pages_text))
 
 def fetch_youtube_transcript_text(url: str) -> Tuple[str, str]:
@@ -233,11 +238,16 @@ def build_or_load(links_file: str, api_key: str, force_rebuild: bool = False):
 
 # --- Chat & Retrieval Logic ---
 SYSTEM_INSTRUCTIONS = """You are a breastfeeding education chatbot for an NGO.
-You MUST answer using only the provided SOURCES (snippets).
-If the SOURCES do not contain the answer, reply exactly:
+
+RULE 1: If the question is about BREASTFEEDING or MATERNAL HEALTH, you MUST provide an answer. 
+- First, check the provided SOURCES. 
+- If the SOURCES do not have the specific answer, use your general training data. 
+- If you use general training data, you MUST start your response with "EXTERNAL_KNOWLEDGE:".
+
+RULE 2: If the question is totally UNRELATED to breastfeeding (e.g., broken bones, car repair, history), reply: 
 "I do not have required information. Please try different question"
-Keep the tone parent-friendly and practical. Do not provide medical diagnosis. 
-Always include citations as a bulleted list of the source URLs you used at the end under 'Sources:'."""
+
+Keep the tone parent-friendly and practical."""
 
 def retrieve(client: OpenAI, index, chunks: List[DocChunk], query: str, top_k: int = TOP_K):
     qvec = embed_texts(client, [query])
@@ -250,34 +260,54 @@ def retrieve(client: OpenAI, index, chunks: List[DocChunk], query: str, top_k: i
 def make_answer(client: OpenAI, model: str, question: str, retrieved: List[Tuple[float, DocChunk]]) -> str:
     fallback_text = "I do not have required information. Please try different question"
     
-    # 1. Early exit on low similarity
-    best_score = retrieved[0][0] if retrieved else 0.0
-    if best_score < MIN_SIM_THRESHOLD:
-        return fallback_text
-
-    # 2. Prepare Context
+    # Prepare Context
     context_blocks = [f"URL: {ch.source_url}\nSNIPPET: {ch.text}" for _, ch in retrieved]
-    unique_urls = list(dict.fromkeys([ch.source_url for _, ch in retrieved]))
 
-    # 3. Request LLM Answer
+    # Enhanced instructions to filter for truly used sources
+    FILTER_INSTRUCTIONS = SYSTEM_INSTRUCTIONS + (
+        "\nAt the end of your response, if you used information from the provided SOURCES, "
+        "provide a list of those specific URLs after the tag 'USED_URLS:'. Example: USED_URLS: [\"url1\", \"url2\"]"
+    )
+
+    # Request LLM Answer
     resp = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+            {"role": "system", "content": FILTER_INSTRUCTIONS},
             {"role": "user", "content": f"QUESTION: {question}\n\nSOURCES:\n" + "\n".join(context_blocks)}
-        ]
+        ],
+        temperature=0
     )
-    answer = resp.choices[0].message.content.strip()
+    full_content = resp.choices[0].message.content.strip()
 
-    # 4. Hide sources if info is missing
-    if fallback_text.lower() in answer.lower():
+    # 1. Handle strict rejection
+    if fallback_text.lower() in full_content.lower():
         return fallback_text
 
-    # 5. Append sources only if valid
-    if "Sources:" not in answer:
-        answer += "\n\nSources:\n" + "\n".join([f"- {u}" for u in unique_urls])
+    # 2. Extract answer and used URLs
+    if "USED_URLS:" in full_content:
+        answer, url_part = full_content.split("USED_URLS:", 1)
+        try:
+            # Simple list cleaning if not valid JSON
+            used_urls = re.findall(r'https?://\S+', url_part.replace('"', '').replace('[', '').replace(']', ''))
+        except:
+            used_urls = []
+    else:
+        answer = full_content
+        used_urls = []
+
+    # 3. Handle External Knowledge (Internet Fallback)
+    if "EXTERNAL_KNOWLEDGE:" in answer:
+        clean_answer = answer.replace("EXTERNAL_KNOWLEDGE:", "").strip()
+        footer = "\n\n---\n*Note: This topic is not included in the manual; information is being provided from the internet.*"
+        return clean_answer + footer
+
+    # 4. Handle Source-Based Answer with filtered links
+    if used_urls:
+        source_list = "\n".join([f"- {u.rstrip(',').rstrip('.')}" for u in list(dict.fromkeys(used_urls))])
+        return f"{answer.strip()}\n\nAdditional Resources:\n{source_list}"
     
-    return answer
+    return answer.strip()
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="Palav Breastfeeding Chatbot", layout="centered")
@@ -292,17 +322,15 @@ ADMIN_MODE = str(st.secrets.get("ADMIN_MODE", "false")).lower() in {"true", "1"}
 
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Welcome to Palav Breastifeeding Userguide. Ask me any breastfeeding question. I will answer only from the trusted resources.\n\n Disclaimer: The information that I provide is for education purpose and is not meant to replace medical advice. I am not HIPPA compliant, please do not enter PII or PHI information such as name, SSN, address, billing, medical record etc."}
+        {"role": "assistant", "content": "Welcome to Palav Breastifeeding Userguide. You can ask me any breastfeeding question. \n\n Disclaimer: The information that I provide is for education purpose and is not meant to replace medical advice. I am not HIPPA compliant, please do not enter PII or PHI information such as name, SSN, address, billing, medical record etc."}
     ]
 
-# Build/Load
 try:
     index, vectors, chunks, report, key, paths, loaded = build_or_load(DEFAULT_LINKS_FILE, api_key)
 except Exception as e:
     st.error(f"Failed to load index: {e}")
     st.stop()
 
-# Display Chat
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]): st.markdown(msg["content"])
 
